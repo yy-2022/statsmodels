@@ -9,6 +9,7 @@ This module implements standard regression models:
 Generalized Least Squares (GLS)
 Ordinary Least Squares (OLS)
 Weighted Least Squares (WLS)
+Weighted Average Least Squares (WALS)
 Generalized Least Squares with autoregressive error terms GLSAR(p)
 
 Models are specified with an endogenous response variable and an
@@ -3211,3 +3212,1249 @@ class RegressionResultsWrapper(wrap.ResultsWrapper):
 
 wrap.populate_wrapper(RegressionResultsWrapper,
                       RegressionResults)
+
+
+import scipy.integrate as integrate
+from scipy.integrate import quad
+import numpy as np
+from scipy.special import gamma, gammainc
+from scipy.optimize import root_scalar
+import scipy.special as sc
+from scipy.stats import norm
+import statsmodels.api as sm
+import statsmodels.base.model as base
+from statsmodels.iolib.summary import SimpleTable, fmt_2cols, fmt_params
+
+import pandas as pd
+from statsmodels.regression.linear_model import RegressionResults
+
+
+class WALS(base.Model):
+    __doc__ = """
+    version: 0.2/2021-10-16
+    Weighted Average Least Squares
+
+    %(params)s
+    %(extra_params)s
+    
+    Parameters
+    ----------
+    endog : array_like
+        A 1-d endogenous response variable. The dependent variable.
+    exog_focus : array_like
+        An n x dim_X1 matrix or data frame containing the focus regressors. If no_cons = FALSE, a constant term is added to the (beginning of) focus regressors, and the number of focus regressors is k1 = dim_X1+1. If no_cons = TRUE, k1 = dim_X1. Default value of X_focus is NULL, which cannot occur at the same time as the option no_cons=TRUE since the minimum number of focus regressors is 1.
+    exog_auxiliary : array_like
+        An n x dim_X2 matrix or data frame containing the auxiliary regressors. If aux_cons = TRUE, a constant term is added to the (end of) auxiliary regressors, and the number of auxiliary regressors is k2 = dim_X2+1. If aux_cons = FALSE, k2 = dim_X2. Default value of X_aux is NULL, which cannot occur at the same time as the option aux_cons=FALSE since the minimum number of auxiliary regressors is 1.
+    no_cons : boolean, optional 
+        Whether to add a constant to the focus regressors and include in the model. Default value is False.
+    aux_cons : boolean, optional 
+        Whether to add a constant to the auxiliary regressors and include in the model. Default value is False. The options no_cons = False and aux_cons = True cannot occur at the same time since only one constant term is allowed in the model.
+    prior : string, optional
+        The chosen prior distribution, can be one of "weibull", "subbotin", "laplace". Default value is "weibull".
+    choice_q : string, optional
+        Choice of the parameter q for Weibull and Subbotin priors. Can be "minimax" or "0.5". This is ignored for Laplace priors. Default value is "minimax".
+    **kwargs
+        Additional keyword arguments used to initialize the results.
+    
+    
+    Examples
+    --------
+    >>> from wals import WALS
+    >>> import pandas as pd
+    >>> data = pd.read_csv('data/growth_data.csv', engine='python')
+    >>> y = data.growth
+    >>> X_focus = data[["gdp60", "equipinv", "school60", "life60", "dpop"]]
+    >>> X_aux = data[["law", "tropics",  "avelf","confuc"]]
+    >>> wals_model = WALS(y, X_focus, X_aux)
+    >>> results = wals_model.fit()
+    >>> results.params
+    >>> results.t
+
+    """ % {'params': base._model_params_doc,
+           'extra_params': base._missing_param_doc + base._extra_param_doc}
+    
+
+    def __init__(self, endog, exog_focus, exog_auxiliary, 
+                 no_cons=False, aux_cons=False, 
+                 prior='weibull', choice_q='minimax',
+                 **kwargs):
+        
+        self.coef_names = None
+        self.data = self._handle_data(endog, exog_focus, exog_auxiliary, 
+                     no_cons=no_cons, aux_cons=aux_cons, **kwargs)
+        self.endog = self.data['endog']
+        self.exog_focus = self.data['exog_focus']
+        self.exog_auxiliary = self.data['exog_auxiliary']
+        self.exog = np.hstack((self.exog_focus, self.exog_auxiliary))
+        self.prior = prior
+        self.choice_q = choice_q
+        self.no_cons = no_cons
+        self.aux_cons = aux_cons
+        
+        
+        self._df_model = None
+        self._df_resid = None
+        self.rank = None
+       
+        self.n_obs = self.endog.shape[0]
+        self.k1 = self.exog_focus.shape[1]
+        self.k2 = self.exog_auxiliary.shape[1]
+        self.k = self.k1 + self.k2
+        
+            
+        if 'coef_names' in kwargs:
+            self.coef_names = kwargs.get('coef_names')
+        elif not self.coef_names:
+            self.coef_names = [f"X_{i+1}" for i in range(self.k)]
+
+
+        self._init_keys = list(kwargs.keys())
+        self._check_input()
+        self._check_dimension()
+        
+        self._load_tab_data()
+        self._load_par()
+        
+        self.mc_draws = None
+        
+        
+    def _load_tab_data(self):
+        if self.prior=="weibull":
+            if self.choice_q=="minimax":
+                mc_tab = pd.read_csv("data/MC_BV_PM_W_minimax.csv")[['eta', 'MC_delta_eta', 'MC_sigma2_eta']]
+            if self.choice_q=="0.5":
+                mc_tab = pd.read_csv("data/MC_BV_PM_W_05.csv")[['eta', 'MC_delta_eta', 'MC_sigma2_eta']]
+        elif self.prior=="subbotin":
+            if self.choice_q=="minimax":
+                mc_tab = pd.read_csv("data/MC_BV_PM_S_minimax.csv")[['eta', 'MC_delta_eta', 'MC_sigma2_eta']]
+            if self.choice_q=="0.5":
+                mc_tab = pd.read_csv("data/MC_BV_PM_S_05.csv")[['eta', 'MC_delta_eta', 'MC_sigma2_eta']]
+        elif self.prior=="laplace":
+            mc_tab = pd.read_csv("data/MC_BV_PM_L.csv")[['eta', 'MC_delta_eta', 'MC_sigma2_eta']]
+        
+        self.mc_tab = mc_tab
+
+        
+    
+    def _check_input(self):
+        if self.prior not in ['weibull', 'subbotin', 'laplace']:
+            raise ValueError(f"Prior must be 'weibull', 'subbotin', or 'laplace'. {self.prior} is not supported")
+        if self.choice_q not in ['minimax', '0.5']:
+            raise ValueError(f"choice_q must be 'minimax', or '0.5'. {self.choice_q} is not supported")
+            
+    def _check_fit_method(self):
+
+        if self.plugin_type not in ['ds', 'ml']:
+            raise ValueError(f"Plug-in type must be 'ds', or 'ml'. {self.plugin_type} is not supported")      
+        if self.conf_int_type not in ['mc', 'naive']:
+            raise ValueError(f"Confidence interval type must be 'mc', or 'naive'. {self.conf_int_type} is not supported")
+        
+
+        
+    def _handle_data(self, endog, exog_focus, exog_auxiliary, 
+                     no_cons=False, aux_cons=False, **kwargs):
+        data = {}
+        data['endog'] = np.asarray(endog).reshape(-1, 1)
+
+        
+        if no_cons and aux_cons:
+            # no constant in focus regressor, include constant in aux regressor
+            if exog_focus is None:
+                raise ValueError('At least one focus regressor must be provided if no_cons is True')
+            else:
+                data['exog_focus'] = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+                try:
+                    coef_names_focus = exog_focus.columns.tolist()
+                except:
+                    coef_names_focus = []
+            
+            if exog_auxiliary is None:
+                exog_auxiliary = np.ones(endog.shape[0])
+                coef_names_aux = ['constant']
+            else:
+                exog_auxiliary = sm.add_constant(exog_auxiliary)
+                try:
+                    coef_names_aux = exog_auxiliary.columns.tolist()
+                except:
+                    coef_names_aux = []
+                    
+                
+            data['exog_auxiliary'] = np.asarray(exog_auxiliary).reshape(exog_auxiliary[0], -1)
+        
+        if no_cons and not aux_cons:
+            # no constant in focus regressor, no constant in aux regressor
+            if exog_focus is None:
+                raise ValueError('At least one focus regressor must be provided if no_cons is True')
+            else:
+                data['exog_focus'] = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+                try:
+                    coef_names_focus = exog_focus.columns.tolist()
+                except:
+                    coef_names_focus = []
+            if exog_auxiliary is None:
+                raise ValueError('At least one auxiliary regressor must be provided if aux_cons is False')
+            else:
+                data['exog_auxiliary'] = np.asarray(exog_auxiliary).reshape(exog_auxiliary.shape[0], -1)
+                try:
+                    coef_names_aux = exog_auxiliary.columns.tolist()
+                except:
+                    coef_names_aux = []
+            
+                
+        if not no_cons and not aux_cons:
+            # constant in focus regressor, no constant in aux regressor
+            if exog_focus is None:
+                exog_focus = np.ones(endog.shape[0])
+                coef_names_focus = ['constant']
+            else:
+                exog_focus = sm.add_constant(exog_focus)
+                try:
+                    coef_names_focus = exog_focus.columns.tolist()
+                except:
+                    coef_names_focus = []
+            data['exog_focus'] = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+            
+            if exog_auxiliary is None:
+                raise ValueError('At least one auxiliary regressor must be provided if aux_cons is False')
+            else:
+                data['exog_auxiliary'] = np.asarray(exog_auxiliary)
+                try:
+                    coef_names_aux = exog_auxiliary.columns.tolist()
+                except:
+                    coef_names_aux = []
+
+        if (not coef_names_focus) or (not coef_names_aux):
+            self.coef_names = None
+        else:
+            self.coef_names = coef_names_focus + coef_names_aux
+            
+        if not no_cons and aux_cons:
+            raise ValueError('''no_cons==False and aux_cons==True is not allowed at the same time.
+            Choose whether to include the constant term as a focus or auxiliary regressor''')
+ 
+        return data
+    
+    
+    def _check_full_rank(self):
+        """
+        Check if input matrix has full column rank
+        """
+        data = np.hstack((self.exog_focus, self.exog_auxiliary))
+        rank = np.linalg.matrix_rank(data)
+
+        assert rank==self.k, "Input data does not have full column rank, check for multicollinearity"
+        return True
+
+    def _check_dimension(self):
+        assert self.k1>=1, "The model must contain at least one focus regressor (including - if any - the constant term)"
+        assert self.k2>=1, "The model must contain at least one auxiliary regressor (including - if any - the constant term)"
+        assert self.n_obs==self.exog_focus.shape[0], "exog_focus should have the same number of rows as endog"
+        assert self.n_obs==self.exog_auxiliary.shape[0], "exog_auxiliary should have the same number of rows as endog"
+        assert self.n_obs >= self.k, "The number of observations should be larger than the number of regressors"
+        
+        self._check_full_rank()
+        
+        return True
+    
+    def _normalize(self):
+        self.endog_n = np.divide(self.endog, np.sqrt(self.n_obs))
+        self.exog_focus_n = np.divide(self.exog_focus, np.sqrt(self.n_obs))
+        self.exog_auxiliary_n = np.divide(self.exog_auxiliary, np.sqrt(self.n_obs))
+        
+    # gl_pw
+    def gl_pw(quad_pts, alpha:float = 0.0):
+        """
+        Function to calculate Gauss-Laguerre quadrature points and weights
+        """ 
+        i1 = np.array(range(1, quad_pts+1))
+        i2 = np.array(range(1, quad_pts))
+        a = 2 * i1  + alpha - 1 
+        b = np.sqrt(i2 * (i2 + alpha))
+
+        z1 = np.zeros((1, quad_pts))
+        z2 = np.zeros((1, quad_pts - 1))
+        zero_padded_diagb = np.vstack((z1, np.hstack((np.diag(b), z2.T))))
+
+        CM = np.diag(a) + zero_padded_diagb + zero_padded_diagb.T
+        L, V = np.linalg.eigh(CM)
+        w = gamma(alpha + 1) * ((V.T)**2)[:, 0]
+
+        return L, w
+
+
+    def neutrality_c(b:float, c: float = 0.799512530172489):
+
+        g = sc.gammainc(b, 1/c) - sc.gamma(1/c)/2
+        return g
+
+
+
+    def _load_par(self):
+        if self.prior=="laplace":
+            self.c = 1
+            self.a = 0
+            self.b = np.log(2)
+            self.d = (1 - self.a) / self.c
+
+        if self.prior=="weibull":
+            if self.choice_q=="minimax":
+                self.c = 0.887630085544086
+            if self.choice_q=="0.5": 
+                self.c = 0.5
+                
+            self.a = 1 - self.c
+            self.b = np.log(2)
+            self.d = (1 - self.a) / self.c
+
+        if self.prior=="subbotin":
+            if self.choice_q=="minimax":
+                self.c = 0.799512530172489
+                self.b = 0.937671295063556
+            if self.choice_q=="0.5": 
+                self.c = 0.5
+                self.b = 1.678346990016661
+
+            self.a = 0
+            self.d = (1 - self.a) / self.c
+
+            
+    def _load_GL(self):
+        """Load the parameters necessary for Gauss-Laguerre quadrature"""
+        quad_pts = self.quad_pts
+        a, b, c, d = self.a, self.b, self.c, self.d 
+        self.GL_eta, self.GL_weight = WALS.gl_pw(self.quad_pts, 0)
+        self.GL_prior = (c * b**d) / (2 * sc.gamma(d)) * np.abs(self.GL_eta)**(-a) * np.exp(-b * (np.abs(self.GL_eta)**c))
+
+
+
+    def posterior_mean(x, prior, a, b, c, d, quad_pts=None, 
+                          GL_eta=None, GL_weight=None, GL_prior=None,
+                          PM_cutoff=10):
+        """Raw (non-central) moments of order h from the posterior
+        distribution obtained with normal location model under the 
+        (reflected) Generalize Gamma Prior distributions (e.g. Weibull and 
+        Subbotin) or Laplace prior."""
+
+        # number of data points to be evaluated
+        x = np.asarray(x).reshape(-1, 1)
+        dim_x = x.shape[0]
+
+
+        # compute raw moments
+        raw_mom = np.zeros((dim_x, 1))
+
+        if prior in ["weibull", "subbotin"]:
+            exp_GL_eta = np.nan_to_num(np.exp(GL_eta))
+
+            for nn in range(dim_x):
+                x_n = x[nn]
+                if x_n==0:
+                    raw_mom.loc[nn, 0] = 0
+
+                A = np.zeros((quad_pts, 2))
+                
+                if np.abs(x_n)<=PM_cutoff:
+                    phi0 = norm.pdf(x_n - GL_eta) + norm.pdf(x_n + GL_eta)
+                    A[:, 0] = phi0 * GL_prior * exp_GL_eta
+
+                    phi1 = (x_n - GL_eta) * norm.pdf(x_n - GL_eta) + \
+                    (x_n + GL_eta) * norm.pdf(x_n + GL_eta)
+                    A[:, 1] = phi1 * GL_prior * exp_GL_eta
+                   
+                else:
+                    Q_x = 1 + GL_eta/x_n
+                    Q_mx = 1 - GL_eta/x_n
+                    G_x = (np.abs(Q_x)**(-a))  * (np.exp(-b*np.abs(x_n)**c *(np.abs(Q_x)**c -1)))
+                    G_mx = (np.abs(Q_mx)**(-a)) * (np.exp(-b*np.abs(x_n)**c *(np.abs(Q_mx)**c-1)))
+
+                    A[:, 0] = (G_mx+G_x) *norm.pdf(GL_eta) * exp_GL_eta
+                    A[:, 1] = GL_eta * (G_mx-G_x) *norm.pdf(GL_eta) * exp_GL_eta
+    
+                raw_mom[nn, 0] = x_n - np.inner(A[:, 1], GL_weight)/np.inner(A[:, 0], GL_weight)
+
+
+        if prior=="laplace":
+            alpha1 = -b + x
+            P1 = np.zeros((dim_x, 1))
+            
+            P1[:, 0] = (-alpha1 * norm.cdf(alpha1) - norm.pdf(alpha1)).flatten()
+
+ 
+            alpha2 = -b - x
+            P2 = np.zeros((dim_x, 1))
+            P2[:, 0] = (-alpha2 * norm.cdf(alpha2) - norm.pdf(alpha2)).flatten()
+
+            G = np.exp(-b * x) * norm.cdf(alpha1) + np.exp(b * x) * norm.cdf(alpha2)
+            
+            raw_mom[:, 0] = np.divide((np.multiply((-1)*np.exp(-b*x), P1) + np.multiply(np.exp(b*x) , P2)), G).flatten()
+
+        return raw_mom
+
+
+    def draws_bcpm(hat_eta, reps, mc_tab, 
+                   prior, 
+                   plugin_type, 
+                   a, b, c, d, 
+                   quad_pts, GL_eta, GL_weight, GL_prior, 
+                   PM_cutoff,
+                   seed=1):
+        
+
+        hat_eta = np.asarray(hat_eta).reshape(-1, 1)
+        k2 = hat_eta.shape[0]
+
+        draws = np.zeros((reps, k2))
+        exp_GL_eta = np.nan_to_num(np.exp(GL_eta))
+        
+
+
+        if prior in ["weibull", "subbotin"]:
+            for h in range(k2):
+                xs_h = norm.rvs(loc=hat_eta[h], scale=1, size=reps, random_state=seed)
+
+                for r in range(reps):
+                    xs_rh = xs_h[r]
+                    A = np.zeros((quad_pts, 2))
+
+                    if np.abs(xs_rh)<=PM_cutoff:
+                        phi0 = norm.pdf(xs_rh - GL_eta) + norm.pdf(xs_rh + GL_eta)
+                        A[:, 0] = phi0 * GL_prior * exp_GL_eta
+
+                        phi1 = (xs_rh - GL_eta) * norm.pdf(xs_rh - GL_eta) + \
+                        (xs_rh + GL_eta) * norm.pdf(xs_rh + GL_eta)
+                        A[:, 1] = phi1 * GL_prior * exp_GL_eta
+                    else:
+                        Q_x = 1 + GL_eta/xs_rh
+                        Q_mx = 1 - GL_eta/xs_rh
+                        G_x = (np.abs(Q_x)**(-a))  * (np.exp(-b*np.abs(xs_rh)**c *(np.abs(Q_x)**c -1)))
+                        G_mx = (np.abs(Q_mx)**(-a)) * (np.exp(-b*np.abs(xs_rh)**c *(np.abs(Q_mx)**c-1)))
+
+                        A[:, 0] = (G_mx+G_x) *norm.pdf(GL_eta) * exp_GL_eta
+
+                        A[:, 1] = GL_eta * (G_mx-G_x) *norm.pdf(GL_eta) * exp_GL_eta
+
+                    draws[r, h] = xs_rh - np.inner(A[:, 1], GL_weight)/np.inner(A[:, 0], GL_weight)
+                    
+                if plugin_type=="ds":
+                    hat_delta, _ = WALS.plugin_posterior_mean(draws[:, h], mc_tab, 0.01,
+                                                             prior, a, b, c)
+                    draws[:, h] = draws[:, h] - hat_delta.flatten()
+
+                if plugin_type=="ml":
+                    hat_delta, _ = WALS.plugin_posterior_mean(xs_h, mc_tab, 0.01,
+                                                             prior, a, b, c)
+                    draws[:, h] = draws[:, h] - hat_delta.flatten()
+
+
+        if prior=="laplace":
+            for h in range(k2):
+                xs_h = norm.rvs(loc=hat_eta[h], scale=1, size=reps, random_state=seed)
+                draws[:, h] = WALS.posterior_mean(xs_h, prior,
+                                                   a, b, c, d, PM_cutoff=PM_cutoff).flatten()
+                if plugin_type=="ds":
+                    hat_delta, _ = WALS.plugin_posterior_mean(draws[:, h], mc_tab, 0.01,
+                                                             prior, a, b, c)
+                    draws[:, h] = draws[:, h] - hat_delta.flatten()
+
+                if plugin_type=="ml":
+                    hat_delta, _ = WALS.plugin_posterior_mean(xs_h, mc_tab, 0.01,
+                                                             prior, a, b, c)
+                    draws[:, h] = draws[:, h] - hat_delta.flatten()
+
+        return draws
+
+
+
+    def plugin_posterior_mean(hat_eta, mc_tab, step,
+                             prior, a, b, c):
+        hat_eta = np.array(np.squeeze(hat_eta)).reshape(-1, 1)
+        H = hat_eta.shape[0]
+
+        n_mc = mc_tab.shape[0]
+
+        max_eta = np.max(mc_tab.loc[:, 'eta'])
+        hat_eta_sign = np.sign(hat_eta).reshape(-1, 1)
+
+        C = 1/step
+        
+        if prior in ["weibull", "subbotin"]:
+            # Fix the estimation method for each component of hat_eta
+            method = ((np.abs(hat_eta) <= (max_eta - step)) + 2*(np.abs(hat_eta) > (max_eta - step))).flatten()
+            Eta1 = hat_eta[method==1].flatten()
+            Eta2 = hat_eta[method==2].flatten()
+            m1_ind = np.where(method==1)[0]
+            m2_ind = np.where(method==2)[0]
+            
+            # Method 1: linear interpolation between MC tabulations
+            if len(Eta1)>0:
+                Eta1_sign = np.sign(Eta1)
+
+                Eta1_L = np.abs(np.round(Eta1*C) / C)
+                Eta1_U = np.abs(np.round((Eta1*C) + Eta1_sign) / C)
+
+                Eta1_L_ind = np.round(Eta1_L*C).astype(int).flatten()
+                Eta1_U_ind = np.round(Eta1_U*C).astype(int).flatten()
+                
+                Eta1_L_wgt = (Eta1_U - np.abs(Eta1))/(Eta1_U - Eta1_L)
+                Eta1_L_wgt = np.nan_to_num(Eta1_L_wgt)
+                    
+                Eta1_U_wgt = (np.ones(Eta1_L_wgt.shape) - Eta1_L_wgt)
+
+                hat_delta_1 = Eta1_sign * (Eta1_L_wgt * mc_tab.loc[Eta1_L_ind, 'MC_delta_eta'].reset_index(drop=True) +\
+                                              Eta1_U_wgt * mc_tab.loc[Eta1_U_ind, 'MC_delta_eta'].reset_index(drop=True))
+
+                hat_sigma2_1 = Eta1_L_wgt * mc_tab.loc[Eta1_L_ind, 'MC_sigma2_eta'].reset_index(drop=True) +\
+                    Eta1_U_wgt * mc_tab.loc[Eta1_U_ind, 'MC_sigma2_eta'].reset_index(drop=True)
+                    
+            # Method 2: asymptotic approximations
+            if len(Eta2)>0:
+                Eta2_sign = np.sign(Eta2)
+                
+                MC_points = mc_tab.index[-1]
+                MC_eta_last = mc_tab.loc[MC_points, 'eta']#.values[0]
+
+                # bias
+                MC_delta_last = mc_tab.loc[MC_points, 'MC_delta_eta']#.values[0]
+                if prior=="weibull":
+                    shift = -(MC_delta_last + b * c / MC_eta_last**(1 - c)) * MC_eta_last - (1 - c)
+                    hat_delta_2 = Eta2_sign * (-b * c * np.abs(Eta2)**(c-1) - (1 - c + shift)/abs(Eta2))
+                if prior=="subbotin":
+                    shift = -(MC_delta_last * MC_eta_last**(1 - c) + b * c) * MC_eta_last
+                    hat_delta_2 = Eta2_sign * (- (shift/np.abs(Eta2) + b * c) * abs(Eta2)**(c - 1))
+                    
+                # variance
+                mc_var_max_eta = mc_tab.loc[mc_tab.eta==max_eta, 'MC_sigma2_eta'].values[0]
+                aa = np.abs(max_eta)**(1/c) * (mc_var_max_eta - 1)
+                hat_sigma2_2 = 1 + aa / np.abs(Eta2)**(1/c)
+                
+            if len(Eta1)>0 and len(Eta2)==0:
+                hat_delta = hat_delta_1
+                hat_sigma2 = hat_sigma2_1
+            elif len(Eta1)==0 and len(Eta2)>0:
+                hat_delta = hat_delta_2
+                hat_sigma2 = hat_sigma2_2
+            elif len(Eta1)>0 and len(Eta2)>0:
+                hat_delta_1 = pd.Series(hat_delta_1)
+                hat_delta_1.index = m1_ind
+                hat_delta_2 = pd.Series(hat_delta_2)
+                hat_delta_2.index = m2_ind
+                
+                hat_sigma2_1 = pd.Series(hat_sigma2_1)
+                hat_sigma2_1.index = m1_ind
+                hat_sigma2_2 = pd.Series(hat_sigma2_2)
+                hat_sigma2_2.index = m2_ind
+
+                hat_delta = pd.concat((hat_delta_1,  hat_delta_2)).sort_index()
+                hat_sigma2 = pd.concat((hat_sigma2_1,  hat_sigma2_2)).sort_index()
+                
+
+        if prior=="laplace":
+            hat_eta_L = (np.minimum(np.abs(np.round(hat_eta*C))/C,
+                              max_eta*np.ones((H, 1)))).flatten()
+            hat_eta_U = (np.minimum(np.abs(np.round(hat_eta*C + hat_eta_sign))/C,
+                              max_eta*np.ones((H, 1)))).flatten()
+            hat_eta_L_ind = (np.round(hat_eta_L*C).astype(int)).flatten()
+            hat_eta_U_ind = (np.round(hat_eta_U*C).astype(int)).flatten()
+
+            hat_eta_L_weight = ((hat_eta_U - np.abs(hat_eta.flatten()))/(hat_eta_U - hat_eta_L))
+            hat_eta_L_weight = (np.nan_to_num(hat_eta_L_weight)).flatten()
+
+            hat_eta_U_weight = ((np.ones(hat_eta_L_weight.shape)  - hat_eta_L_weight)).flatten()
+
+            
+            hat_delta = np.multiply(hat_eta_sign.flatten(), 
+                                    hat_eta_L_weight * (mc_tab.loc[hat_eta_L_ind, 'MC_delta_eta']) +\
+                                    hat_eta_U_weight *( mc_tab.loc[hat_eta_U_ind, 'MC_delta_eta']))
+
+            hat_sigma2 = hat_eta_L_weight * (mc_tab.loc[hat_eta_L_ind, 'MC_sigma2_eta']) +\
+                hat_eta_U_weight * (mc_tab.loc[hat_eta_U_ind, 'MC_sigma2_eta'])
+
+        return np.asarray(hat_delta).reshape(-1, 1), np.asarray(hat_sigma2).reshape(-1, 1)
+    
+    
+    @property
+    def df_model(self):
+        """
+        The model degree of freedom.
+        The dof is defined as the rank of the regressor matrix minus 1 if a
+        constant is included.
+        """
+        if self._df_model is None:
+            if self.rank is None:
+                self.rank = np.linalg.matrix_rank(self.exog)
+            self._df_model = float(self.rank - self.k)
+        return self._df_model
+
+    @df_model.setter
+    def df_model(self, value):
+        self._df_model = value
+
+    @property
+    def df_resid(self):
+        """
+        The residual degree of freedom.
+        The dof is defined as the number of observations minus the rank of
+        the regressor matrix.
+        """
+
+        if self._df_resid is None:
+            if self.rank is None:
+                self.rank = np.linalg.matrix_rank(self.exog)
+            self._df_resid = self.n_obs - self.rank
+        return self._df_resid
+
+    @df_resid.setter
+    def df_resid(self, value):
+        self._df_resid = value
+        
+       
+
+    def fit(self, 
+            plugin_type='ds', 
+            conf_int_type='mc', conf_levels=95,
+            quad_pts=1000,
+            mc_reps =5000, 
+            mc_seed=1,
+            mc_save=False,
+            sigma=None,
+            **kwargs):
+        
+        """
+        Fitting method for WALS regression model
+
+        Parameters
+        ----------
+        plugin_type : string, optional
+            The type of plug-in estimation to use, can be "ds" (double shrinkage) or "ml" (maximum likelihood). Default value is "ds".    
+        conf_int_type : string, optional
+            The type of the confidence interval, can be "mc" or "naive". Default value is "mc".
+        conf_levels : int or array-like, optional
+            An integer (or array of integers) between 0 to 100, the significance level of the confidence intervals of the parameter estimates.
+        quad_pts : int, optional
+            The number of quadrature points to use in the Gauss-Laguerre quadrature method. Default value is 1000. This is ignored for Laplace priors since closed-form solution is available and numerical integration is not necessary for Laplace priors.
+        mc_reps : int, optional
+            The number of repetitions to use for Monte Carlo draws used in the calculation of bias-corrected posterior moments and construction of confidence intervals.
+        mc_seed : int, optional
+            The random seed to use for Monte Carlo draws. Default value is 1.
+        mc_save : boolean, optional
+            If True, save the Monte Carlo simulated draws of the bias correction. mc_save = True is necessary if prediction intervals are needed for WALS prediction. Default value is False.
+        sigma : float, optional
+            If None, infer the sigma from data. Otherwise, specify a positive real number as the standard deviation of the error term.
+        **kwargs
+            Additional keyword arguments used to initialize the results.
+
+        Returns
+        ----------
+        An object of class WALSResults containing the following attributes:
+
+        params : array-like
+            Coefficient estimates.
+        bias : array-like
+            The estimated bias of the coefficient estimates.
+        variance : matrix
+            The variance covariance matrix of the coefficient estimates.
+        mse : matrix
+            The MSE of the model.
+        rmse : array-like
+            The RMSE of the model.
+        varmse : array-like
+            The variance to MSE ratio of the model.
+        std_error : array-like
+            The standard error of the coefficient estimates.
+        t : array-like
+            The t statistic of the coefficient estimates.
+        ci : array-like
+            The confidence intervals of the coefficient estimates.
+        skewnewss : array-like
+            The skewness of the (bias-corrected) WALS estimator.
+
+        kurtosis : array-like
+            The kurtosis of the (bias-corrected) WALS estimator.
+        condnum : array-like
+            The condition number of the data.
+        s : array-like
+            The estimated sigma (if not provided ex ante) or user-specified sigma of the model.
+        """
+
+        self.plugin_type = plugin_type
+        self.conf_int_type = conf_int_type
+        self.conf_levels = conf_levels if isinstance(conf_levels, list) else [conf_levels]
+        self.quad_pts = quad_pts
+        self.mc_reps = mc_reps
+        self.mc_seed = mc_seed
+        self.mc_save = mc_save
+        self.sigma = sigma  
+        self.PM_cutoff = 10
+        
+        self._check_fit_method()
+        if sigma:
+            assert sigma>0, 'sigma is incorrectly specified. If not None, the user-specified sigma must be a positive real number'
+        
+        # Step 1: define model and parameters
+        
+        self._load_par()
+        self._load_GL()
+        
+        self.ci_lbs = [(100 - cl) / 100 * 0.5 for cl in self.conf_levels]
+        self.ci_ubs = [1 - (100 - cl) / 100 * 0.5 for cl in self.conf_levels]
+        
+        self._normalize()
+        
+        y = self.endog_n
+        X1 = self.exog_focus_n
+        X2 = self.exog_auxiliary_n
+       
+        
+        # Step 2: Scaling to ensure equivariance
+        
+        # Step 2.a: Scaling X1 so that all diagonal elements of (X1*Delta1)'X1*Delta1 are all one
+        Delta1 = np.diag(np.diag(np.matmul(X1.T, X1))**(- 1 / 2))
+        Z1 = np.matmul(X1, Delta1)
+
+        # Step 2.b: Scaling X2 so that all diagonal elements of (Delta2' X2' M1 X2 Delta2) are equal to one
+        IC_Z1Z1 = np.linalg.inv(np.matmul(Z1.T, Z1))
+        C_Z1X2 = np.matmul(Z1.T, X2) 
+        C_X2X2_Z1 = np.matmul(X2.T, X2)  -  np.matmul(np.matmul(C_Z1X2.T, IC_Z1Z1), C_Z1X2)
+        Delta2 = np.diag(np.diag(C_X2X2_Z1)**(- 1 / 2))
+        Xi = np.matmul(np.matmul(Delta2, C_X2X2_Z1), Delta2)
+
+        # Step 3: Semi-orthogonalization transformation of X_2
+        
+        # Step 3.a: Condition number of Xi
+        condnum = (np.linalg.cond(Xi))
+
+
+        # Step 3.b: Semi-orthogonalization transformation of X_2
+
+        eig_val, eig_vec  = np.linalg.eigh(Xi)
+        Xi_inv_sqrt = np.matmul(np.matmul(eig_vec, np.diag(1 / np.sqrt(eig_val))), eig_vec.T)
+
+        D2 = np.matmul(Delta2, Xi_inv_sqrt)
+        Z2 = np.matmul(X2, D2)
+
+        # Step 4: key components of the OLS estimates of the unrestricted and restricted models
+        # Step 4.a: unrestricted model
+        Z = np.hstack((Z1, Z2))
+        IC_ZZ = np.linalg.inv(np.matmul(Z.T, Z)) 
+        C_Zy = np.matmul(Z.T, y)
+        hat_g_U = np.matmul(IC_ZZ, C_Zy)
+        
+        if not self.sigma: 
+            res_U = y - np.matmul(np.matmul(Z, IC_ZZ), C_Zy)
+            s2 = float(sum(res_U * res_U) / (self.n_obs - self.k))
+            s = np.sqrt(s2)
+        else:
+            s = self.sigma / np.sqrt(self.n_obs)
+            s2 = s**2
+        
+        hat_g2_U = hat_g_U[self.k1:self.k]
+        x = hat_g2_U / s
+        x = np.array(x)
+        
+        # Step 4.b: Restricted model
+        C_Z1y = np.array(np.matmul(Z1.T, y))
+        
+        # Step 4.c: Additional matrices and vectors needed in the transformations
+        C_Z1Z2 = np.matmul(Z1.T, Z2)
+        Q = np.matmul(IC_Z1Z1, C_Z1Z2)
+        D12 = np.matmul(Delta1, Q)
+
+        # Step 5: Posterior moments of eta_h|x_h (h=1,...,k2) in the NLM
+        if self.prior in ["weibull", "subbotin"]:
+            post_m = WALS.posterior_mean(
+                x, self.prior,
+                self.a, self.b, self.c, self.d,
+                self.quad_pts,
+                self.GL_eta, self.GL_weight, self.GL_prior)
+        if self.prior == "laplace":
+            post_m = WALS.posterior_mean(
+                x, self.prior,
+                self.a, self.b, self.c, self.d,
+                self.quad_pts,
+                self.GL_eta, self.GL_weight, self.GL_prior)
+
+        # Step 6/7: Estimated bias and variance of the posterior mean
+        # Step 6/7.a: plug-in double shrinkage estimator
+        if plugin_type == "ds" :
+            hat_delta, hat_V = WALS.plugin_posterior_mean(post_m, self.mc_tab, 0.01, 
+                                                         self.prior, self.a, self.b, self.c)
+
+        # Step 6/7.b: plug-in maximum likelihood estimator
+        if plugin_type == "ml":
+            hat_delta, hat_V = WALS.plugin_posterior_mean(x, self.mc_tab, 0.01,
+                                                         self.prior, self.a, self.b, self.c)
+            
+        # Step 8: WALS point estimates
+        hat_g2_W = s * post_m
+        hat_g1_W = np.matmul(IC_Z1Z1, (C_Z1y - np.matmul(C_Z1Z2, hat_g2_W)))
+        
+
+
+        
+        hat_b2_W = np.matmul(D2, hat_g2_W)
+        hat_b1_W = np.matmul(Delta1, hat_g1_W)
+
+
+        hat_b_W = np.vstack((hat_b1_W, hat_b2_W))
+
+        # Step 9: Estimated biases of the WALS estimator
+
+        hat_bias_g2_W = s * hat_delta
+        hat_bias_g1_W = np.matmul(-Q, hat_bias_g2_W)
+
+        hat_bias_b2_W = np.matmul(D2, hat_bias_g2_W).reshape(-1, 1)
+        hat_bias_b1_W = np.matmul(Delta1, hat_bias_g1_W).reshape(-1, 1)
+        
+        hat_bias_b_W = np.vstack((hat_bias_b1_W, hat_bias_b2_W))
+
+        # Step 10: Estimated variance of the WALS estimator
+        
+        hat_var_g2_W = s2 * np.diag(np.squeeze(hat_V))
+        hat_var_g1_W = s2 * IC_Z1Z1 + np.matmul(np.matmul(Q, hat_var_g2_W), Q.T)
+        hat_cov_g1g2_W = np.matmul(-Q, hat_var_g2_W)
+
+        hat_var_b2_W = np.matmul(np.matmul(D2, hat_var_g2_W), D2.T)
+        hat_var_b1_W = np.matmul(np.matmul(Delta1, hat_var_g1_W), Delta1.T)
+
+        hat_cov_b1b2_W = np.matmul(np.matmul(Delta1, hat_cov_g1g2_W), D2.T)
+
+        hat_var_b_W = np.vstack(
+            (np.hstack((hat_var_b1_W, hat_cov_b1b2_W)),
+             np.hstack((hat_cov_b1b2_W.T, hat_var_b2_W))))
+        
+        b_se = np.sqrt(np.diag(hat_var_b_W).flatten())
+        
+        # Step 11: Estimated MSE matrix of the WALS estimator
+        hat_MSE_b_W = np.outer(hat_bias_b_W, hat_bias_b_W) + hat_var_b_W
+        hat_rmse_b_W = (np.diag(hat_MSE_b_W))**(1 / 2)
+        hat_varmse_b_W = np.diag(hat_var_b_W) / np.diag(hat_MSE_b_W)
+
+        # Step 12: Simulation-based algorithm for confidence intervals
+        # Step 12.a: Draws from the (estimated) sampling distribution of the (bias-corrected) WALS estimator of \beta_2
+        if self.prior in ["weibull", "subbotin"]:
+            draw_pm = WALS.draws_bcpm(
+                post_m - hat_delta, mc_reps, self.mc_tab,
+                self.prior,
+                self.plugin_type,
+                self.a, self.b, self.c, self.d,
+                self.quad_pts,
+                self.GL_eta, self.GL_weight, self.GL_prior,
+                self.PM_cutoff,
+                self.mc_seed)
+        if self.prior == "laplace":
+            draw_pm = WALS.draws_bcpm(
+                post_m - hat_delta, mc_reps, self.mc_tab,
+                self.prior,
+                self.plugin_type,
+                self.a, self.b, self.c, self.d,
+                self.quad_pts,
+                self.GL_eta, self.GL_weight, self.GL_prior,
+                self.PM_cutoff,
+                self.mc_seed)
+
+        draw_b2_W = s * np.matmul(draw_pm, D2.T)
+        
+        # Step 12.b: Draws from the (estimated) sampling distribution of the (bias-corrected) WALS estimator of \beta_1
+        hat_b1_R = np.matmul(np.matmul(Delta1, IC_Z1Z1),  C_Z1y)
+        hat_var_b1_R = s2 * np.matmul(np.matmul(Delta1, IC_Z1Z1), Delta1)
+
+        np.random.seed(self.mc_seed)
+        draw_U1 = np.random.uniform(0, 1, (self.mc_reps, self.k1))
+        mat_1 = np.ones((self.mc_reps, 1))
+        chol_hat_var_b1_R = np.linalg.cholesky(hat_var_b1_R)
+        draw_b1_R = np.kron(hat_b1_R.T, mat_1) + np.matmul(norm.ppf(draw_U1), chol_hat_var_b1_R.T)
+        draw_b1_W = draw_b1_R - s * np.matmul(draw_pm, D12.T)
+
+        # Step 12.c: Draws from the (estimated) sampling distribution of the (bias-corrected) WALS estimator of \beta
+        draw_b_W = np.hstack((draw_b1_W, draw_b2_W))
+
+        #Step 12.d: Store (if required) the draws obtained in step 12.c
+        if mc_save:
+            self.mc_draws = draw_b_W
+        else:
+            self.mc_draws = None
+        
+
+        # Step 13: Confidence intervals
+        # Step 13.a: Simulation-based approach
+        
+        self.conf_int_names = np.asarray([[f'{i:.1%}', f'{j:.1%}'] 
+                                                         for i, j in zip(self.ci_lbs, self.ci_ubs)]).flatten()
+        if conf_int_type == "mc":
+            
+            for i in range(len(self.conf_levels)):
+                ci_lb = self.ci_lbs[i]
+                ci_ub = self.ci_ubs[i]
+                if i==0:
+                    CI_b_W = np.vstack(
+                        (np.quantile(draw_b1_W, [ci_lb, ci_ub], axis=0).T,
+                         np.quantile(draw_b2_W, [ci_lb, ci_ub], axis=0).T))
+                else:
+                    CI_b_W = np.hstack(
+                        (CI_b_W,
+                             np.vstack(
+                                 (np.quantile(draw_b1_W, [ci_lb, ci_ub], axis=0).T,
+                                  np.quantile(draw_b2_W, [ci_lb, ci_ub], axis=0).T))))
+                    
+            
+            # Step 13.b: Naive-and-centered confidence interval (with standard errors of the bias-corrected WALS estimator)
+        if conf_int_type == "naive":
+            hat_var_bbc_W = np.cov(draw_b_W, rowvar=False)
+            hat_se_bbc_W = (np.diag(hat_var_bbc_W))**(1 / 2)
+        
+            for i in range(len(self.conf_levels)):
+                ci_lb = self.ci_lbs[i]
+                ci_ub = self.ci_ubs[i]
+                cv = norm.ppf(ci_ub)
+
+                if i == 0:
+                    CI_b_W = np.hstack(
+                        (hat_b_W - hat_bias_b_W - cv * hat_se_bbc_W,
+                         hat_b_W - hat_bias_b_W + cv * hat_se_bbc_W))
+                else:
+                    CI_b_W = np.hstack(
+                        (CI_b_W,
+                         np.hstack(
+                             (hat_b_W - hat_bias_b_W - cv * hat_se_bbc_W,
+                              hat_b_W - hat_bias_b_W + cv * hat_se_bbc_W))))
+                        
+        # Step 14: Estimated skewness and kurtosis of the (bias-corrected) WALS estimator
+        mean_k = np.mean(draw_b_W, axis=0)
+        dev_k = draw_b_W - mean_k
+        
+        skew = np.mean(dev_k**3, axis=0) / np.mean(dev_k**2, axis=0)**(3/2)
+        kurt = np.mean(dev_k**4, axis=0) / np.mean(dev_k**2, axis=0)**2
+
+        self.s = self.n_obs**0.5 * s
+        
+        fitresult = WALSResults(
+                self, 
+            params=hat_b_W,
+            bias=hat_bias_b_W, 
+            variance=hat_var_b_W,
+            std_error=b_se,
+            mse=hat_MSE_b_W,
+            rmse=hat_rmse_b_W,
+            varmse=hat_varmse_b_W,
+            t = hat_b_W.flatten()/b_se.flatten(),
+            ci=CI_b_W,
+            ci_names = self.conf_int_names,
+            s=self.n_obs**(1 / 2) * s,
+            skew=skew,
+            kurt=kurt,
+            condnum=condnum,
+                **kwargs)
+
+     
+        
+        return fitresult
+    
+    
+
+    
+    
+    
+class WALSResults(RegressionResults):
+    """
+    Results class for for a WALS model.
+    Parameters
+    ----------
+    model : RegressionModel
+        The regression model instance.
+    params : ndarray
+        The estimated parameters.
+    **kwargs
+        Additional keyword arguments used to initialize the results.
+    
+    Methods
+    ----------
+    summary :
+        Summarizes the WALS regression results.
+        
+    predict : 
+        Performs in-sample or out-of-sample prediction for the WALS regression.
+        
+    Examples
+    --------
+    >>> from wals import WALS
+    >>> import pandas as pd
+    >>> data = pd.read_csv('data/growth_data.csv', engine='python')
+    >>> y = data.growth
+    >>> X_focus = data[["gdp60", "equipinv", "school60", "life60", "dpop"]]
+    >>> X_aux = data[["law", "tropics",  "avelf","confuc"]]
+    >>> wals_model = WALS(y, X_focus, X_aux)
+    >>> results = wals_model.fit(mc_save=True)
+    >>> results.params
+    >>> results.t
+    >>> results.predict()
+    >>> results.summary()
+
+    """
+
+    from statsmodels.iolib.summary import SimpleTable, fmt_2cols, fmt_params
+    
+    def __init__(self, model, 
+                 params,
+                 bias, 
+                 variance,
+                 std_error,
+                 mse,
+                 rmse,
+                 varmse,
+                 t,
+                 ci,
+                 ci_names,
+                 s,
+                 skew,
+                 kurt,
+                 condnum,
+                **kwargs):
+        self.model = model
+        self.params = params
+        self.bias = bias
+        self.variance = variance
+        self.std_error = std_error
+        self.mse = mse
+        self.rmse = rmse
+        self.t = t
+        self.ci = ci
+        self.ci_names = ci_names
+        self.s = s
+        self.skew = skew
+        self.kurt = kurt
+        self.condnum=condnum
+
+    
+        
+    def predict(self, 
+                exog_focus = None, 
+                exog_auxiliary = None,
+                PI_level = 95):
+        
+        """
+        Performs prediction for WALS regression model.
+        Parameters
+        ----------
+        
+        exog_focus : array-like, optional
+            Additional input data for the focus regressors. This should be provided in the same order as the focus regressors used for estimation. If a constant term is added during estimation, only the regressors excluding the constant term need to be provided. Default value is None. When exog_focus is not provided, in-sample prediction is performed.
+        exog_auxiliary : array-like, optional
+            Additional input data for the auxiliary regressors. This should be provided in the same order as the auxiliary regressors used for estimation. If a constant term is added during estimation, only the regressors excluding the constant term need to be provided. Default value is None. When exog_focus is not provided, in-sample prediction is performed.
+        PI_level : int or array-like, optional
+            An integer or a sequence of integers between 0 to 100, the confidence level(s) of the prediction. Default value is 95, corresponding to 2.5%, 97.5% prediction intervals.
+        Returns
+        -------
+        A list containing the following elements:
+        y_pred : array
+            Predicted values of y.
+
+        pi_y_pred: ndarray
+            Prediction intervals corresponding to the levels specified in PI_level.
+        
+        """
+    
+        self.PI_level = np.asarray(PI_level).flatten()
+        self.exog_focus = exog_focus
+        self.exog_auxiliary = exog_auxiliary
+
+        assert self.model.mc_save, "Prediction interval cannot be calculated if option mc_save==False in estimation"
+        
+        if (exog_focus is None) &  (exog_auxiliary is None):
+            self.exog_pred = self.model.exog.copy()
+            
+        else:    
+            self._handle_data_pred()
+        
+        PI_lbs = [0.5 * (100 - i)/100 for i in self.PI_level]
+        PI_ubs = [1 - i for i in PI_lbs]
+                
+        self.predicted_values = np.matmul(self.exog_pred, self.params) 
+        
+        pi_all_levels = pd.DataFrame(data=np.zeros((self.exog_pred.shape[0], self.PI_level.shape[0]*2)),
+                                     columns=np.asarray([[f'{i:.1%}', f'{j:.1%}'] 
+                                                         for i, j in zip(PI_lbs, PI_ubs)]).flatten())
+        
+        for i, j in zip(PI_lbs, PI_ubs):
+            
+            pi_draws = np.apply_along_axis(lambda x:np.quantile(np.matmul(self.model.mc_draws, x), 
+                                                    [i, j]), 
+                                axis=1, arr=self.exog_pred)
+            pi_all_levels[[f'{i:.1%}', f'{j:.1%}']] = pi_draws
+            
+        self.PI_all_levels = pi_all_levels
+        
+        return self.predicted_values, pi_all_levels
+        
+        
+        
+        
+    def _handle_data_pred(self): 
+        exog_focus = self.exog_focus
+        exog_auxiliary = self.exog_auxiliary
+        no_cons = self.model.no_cons
+        aux_cons = self.model.aux_cons
+        
+        if no_cons & aux_cons:
+        # no constant in focus regressor, include constant in aux regressor
+            if exog_focus is None:
+                raise ValueError('At least one focus regressor must be provided if no_cons is True')
+            else:
+                exog_focus = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+
+            if exog_auxiliary is None:
+                exog_auxiliary = np.ones(exog_focus.shape[0])
+            else:
+                exog_auxiliary = sm.add_constant(exog_auxiliary)
+
+            exog_auxiliary = np.asarray(exog_auxiliary).reshape(exog_auxiliary.shape[0], -1)
+
+        if (no_cons) & (not aux_cons):
+            # no constant in focus regressor, no constant in aux regressor
+            if exog_focus is None:
+                raise ValueError('At least one focus regressor must be provided if no_cons is True')
+            else:
+                exog_focus = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+
+            if exog_auxiliary is None:
+                raise ValueError('At least one auxiliary regressor must be provided if aux_cons is False')
+            else:
+                exog_auxiliary = np.asarray(exog_auxiliary).reshape(exog_auxiliary.shape[0], -1)
+
+        if (not no_cons) & (not aux_cons):
+        # constant in focus regressor, no constant in aux regressor
+            if exog_auxiliary is None:
+                raise ValueError('At least one auxiliary regressor must be provided if aux_cons is False')
+            else:
+                exog_auxiliary = np.asarray(exog_auxiliary).reshape(exog_auxiliary.shape[0], -1)
+                    
+            if exog_focus is None:
+                exog_focus = np.ones(exog_auxiliary.shape[0])
+            else:
+                exog_focus = sm.add_constant(exog_focus)
+
+            exog_focus = np.asarray(exog_focus).reshape(exog_focus.shape[0], -1)
+            
+        self.exog_pred = np.hstack((exog_focus, exog_auxiliary))
+
+
+
+
+
+    
+
+    def summary(self):
+        """
+        Summarize the Regression Results.
+        
+        Returns
+        -------
+        Summary
+            Instance holding the summary tables and text, which can be printed
+            or converted to various output formats.
+        
+        """
+        title = f"WALS estimates - {self.model.prior} prior"
+
+        top_left = [
+            ("no_cons", str(self.model.no_cons)),
+            ("aux_cons", str(self.model.aux_cons)),
+            ("prior", self.model.prior),
+            ("quad_pts", str(int(self.model.quad_pts))),
+            ("plugin_type", self.model.plugin_type),
+            ("conf_int_type", self.model.conf_int_type),
+            ("mc_reps", str(int(self.model.mc_reps))),
+            ("condition number", f"{self.condnum:.2f}")
+        ]
+
+
+        top_right = [
+            ("Number of obs.", str(int(self.model.n_obs))),
+            ("k1", str(int(self.model.k1))),
+            ("k2", str(int(self.model.k2))),
+            ("a", f"{self.model.a:.4f}"),
+            ("b", f"{self.model.b:.4f}"),
+            ("c", f"{self.model.c:.4f}"),
+            ("d", f"{self.model.d:.4f}"),
+            ("sigma", f"{self.s:.4f}"),
+        ]
+
+        stubs = []
+        vals = []
+        for stub, val in top_left:
+            stubs.append(stub)
+            vals.append([val])
+        table_left = SimpleTable(vals, txt_fmt=fmt_2cols, title=title, stubs=stubs)
+        # create summary table instance
+        from statsmodels.iolib import summary as sumr
+        
+        def _str(v: float) -> str:
+            """Preferred basic formatter"""
+            if np.isnan(v):
+                return "        "
+            av = abs(v)
+            digits = 0
+            if av != 0:
+                digits = int(np.ceil(np.log10(av)))
+            if digits > 4 or digits <= -4:
+                return "{0:8.4g}".format(v)
+
+            if digits > 0:
+                d = int(5 - digits)
+            else:
+                d = int(4)
+
+            format_str = "{0:" + "0.{0}f".format(d) + "}"
+            return format_str.format(v)
+
+
+        def pval_format(v: float) -> str:
+            """Preferred formatting for x in [0,1]"""
+            if np.isnan(v):
+                return "        "
+            return "{0:4.4f}".format(v)
+
+        smry = sumr.Summary()
+        # Top Table
+        # Parameter table
+        fmt = fmt_2cols
+        fmt["data_fmts"][1] = "%18s"
+        
+
+        top_right = [("%-21s" % ("  " + k), v) for k, v in top_right]
+        stubs = []
+        vals = []
+        for stub, val in top_right:
+            stubs.append(stub)
+            vals.append([val])
+        table_right = SimpleTable(vals, stubs=stubs)
+        table_left.extend_right(table_right)            
+            
+        smry.tables.append(table_left)
+
+        params = np.asarray(self.params)
+        bias = np.asarray(self.bias)
+        se = np.asarray(self.std_error)
+        rmse = np.asarray(self.rmse)
+        tstats = np.asarray(self.t)
+        param_data = np.c_[params, bias, se, rmse, tstats, self.ci]
+        data = []
+        for row in param_data:
+            txt_row = []
+            for i, v in enumerate(row):
+                f = _str
+                if i == 3:
+                    f = pval_format
+                txt_row.append(f(v))
+            data.append(txt_row)
+        title = "WALS parameter estimates"
+        table_stubs = self.model.coef_names
+        header = ["Coef.", "Bias", "Std. Err.", "RMSE", "t. stat."] + self.ci_names.tolist()
+        table = SimpleTable(
+            data, stubs=table_stubs, txt_fmt=fmt_params, headers=header, title=title
+        )
+        smry.tables.append(table)
+
+
+        return smry
+
+
